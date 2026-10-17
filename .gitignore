@@ -1,0 +1,28 @@
+Library/
+Assets/Backrooms
+Temp/
+Obj/
+Logs/
+Build/
+Builds/
+UserSettings/Layouts/
+MemoryCaptures/
+Recordings/
+.crash/
+.sysinfo
+.vs/
+*.csproj
+*.sln
+*.user
+*.unityproj
+*.pidb
+*.svd
+*.userprefs
+.DS_Store
+
+# Local user and temporary files
+UserSettings/
+tmp/
+
+# Generated WebGL builds
+WebBuild-Cloudflare/
