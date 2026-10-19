@@ -24,15 +24,27 @@ public class TutorialPlayerMovement : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
+        bool mouseIsCaptured = BrowserMouseCapture.UpdateCapture(true);
 
         // Collect user input
         float h = Input.GetAxis("Horizontal");
         float v = Input.GetAxis("Vertical");
         bool jumpDown = Input.GetButtonDown("Jump");
-        float mouseX = Input.GetAxis("Mouse X");
+        float mouseX = mouseIsCaptured ? Input.GetAxis("Mouse X") : 0f;
         bool runKey = Input.GetKey(KeyCode.LeftShift);
         
         UpdateInput(new Vector2(h, v), mouseX * rotationSpeed, jumpDown, runKey);
+    }
+
+    private void OnDisable()
+    {
+        BrowserMouseCapture.Release();
+    }
+
+    private void OnApplicationFocus(bool hasFocus)
+    {
+        if (!hasFocus)
+            BrowserMouseCapture.Release();
     }
 
     void FixedUpdate()

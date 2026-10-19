@@ -26,3 +26,7 @@ tmp/
 
 # Generated WebGL builds
 WebBuild-Cloudflare/
+
+# Local Cloudflare deployment dependencies and state
+node_modules/
+.wrangler/

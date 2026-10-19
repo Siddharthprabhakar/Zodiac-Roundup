@@ -96,16 +96,33 @@ public class PlayerMovement : NetworkBehaviour
     {
         if (!IsOwner) return;
 
+        bool roundIsPlaying = SingleSceneSessionManager.Instance != null &&
+                              SingleSceneSessionManager.Instance.IsSpawned &&
+                              SingleSceneSessionManager.Instance.Phase.Value == RoundPhase.Playing;
+        bool mouseIsCaptured = BrowserMouseCapture.UpdateCapture(roundIsPlaying);
+
         // Collect user input
         float h = Input.GetAxis("Horizontal");
         float v = Input.GetAxis("Vertical");
         bool jumpDown = Input.GetButtonDown("Jump");
-        float mouseX = Input.GetAxis("Mouse X");
+        float mouseX = mouseIsCaptured ? Input.GetAxis("Mouse X") : 0f;
         bool runKey = Input.GetKey(KeyCode.LeftShift);
 
         // Send input to server
         SendInputServerRpc(new Vector2(h, v), mouseX * rotationSpeed, jumpDown, runKey);
 
+    }
+
+    public override void OnNetworkDespawn()
+    {
+        if (IsOwner)
+            BrowserMouseCapture.Release();
+    }
+
+    private void OnApplicationFocus(bool hasFocus)
+    {
+        if (IsOwner && !hasFocus)
+            BrowserMouseCapture.Release();
     }
 
     void FixedUpdate()

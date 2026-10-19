@@ -1,5 +1,4 @@
-using System.Linq;
-using System.Collections.Generic;
+using System;
 using System.Threading.Tasks;
 using UnityEngine;
 using Unity.Services.Core;
@@ -10,6 +9,9 @@ using Unity.Services.Relay.Models;
 using Unity.Netcode;
 using Unity.Netcode.Transports.UTP;
 using Unity.Networking.Transport.Relay;
+#if UNITY_EDITOR
+using Unity.Multiplayer.Playmode;
+#endif
 
 public class RelayManager : MonoBehaviour
 {
@@ -30,51 +32,42 @@ public class RelayManager : MonoBehaviour
         {
             var options = new InitializationOptions();
             options.SetEnvironmentName(string.IsNullOrWhiteSpace(environmentName) ? "production" : environmentName);
+#if UNITY_EDITOR
+            // Multiplayer Play Mode instances must use different UGS profiles so
+            // they receive different anonymous Authentication player IDs.
+            options.SetProfile(CurrentPlayer.IsMainEditor ? "main-editor" : "virtual-player");
+#endif
             await UnityServices.InitializeAsync(options);
         }
 
         if (!AuthenticationService.Instance.IsSignedIn)
         {
             await AuthenticationService.Instance.SignInAnonymouslyAsync();
-            Debug.Log("[UGS] Signed in anonymously");
+            Debug.Log($"[UGS] Signed in anonymously as {AuthenticationService.Instance.PlayerId}");
         }
     }
 
-    // Accept List<> (or any IEnumerable) because some SDKs expose List<RelayServerEndpoint>
-    static RelayServerEndpoint PickEndpoint(IEnumerable<RelayServerEndpoint> endpoints, string preferred)
-    {
-        if (endpoints == null) return null;
-        // Prefer DTLS; fallback to UDP if DTLS not available
-        var chosen = endpoints.FirstOrDefault(e => e.ConnectionType == preferred)
-                  ?? endpoints.FirstOrDefault(e => e.ConnectionType == "udp");
-        return chosen;
-    }
-
-    // 1) Helper: always cleanly reset before starting host/client
     void ResetNetworking()
     {
         if (NetworkManager.Singleton != null)
         {
-            if (NetworkManager.Singleton.IsServer || NetworkManager.Singleton.IsClient)
+            if (NetworkManager.Singleton.IsListening)
             {
                 NetworkManager.Singleton.Shutdown();
             }
-
-            // UTP sometimes holds on to state across runs; clear its config too
-            var utp = (UnityTransport)NetworkManager.Singleton.NetworkConfig.NetworkTransport;
-            utp.SetConnectionData("", 0); // harmless no-op reset
         }
     }
 
-    // 2) Subscribe once (e.g., in Awake) to catch transport failures
     void OnEnable()
     {
+        if (NetworkManager.Singleton == null) return;
+
         var utp = (UnityTransport)NetworkManager.Singleton.NetworkConfig.NetworkTransport;
         utp.OnTransportEvent += HandleTransportEvent;
 
-        NetworkManager.Singleton.OnClientConnectedCallback += id => Debug.Log($"[Netcode] Client connected: {id}");
-        NetworkManager.Singleton.OnClientDisconnectCallback += id => Debug.Log($"[Netcode] Client disconnected: {id}");
-        NetworkManager.Singleton.OnServerStarted += () => Debug.Log("[Netcode] Server/Host started");
+        NetworkManager.Singleton.OnClientConnectedCallback += HandleClientConnected;
+        NetworkManager.Singleton.OnClientDisconnectCallback += HandleClientDisconnected;
+        NetworkManager.Singleton.OnServerStarted += HandleServerStarted;
     }
 
     void OnDisable()
@@ -83,10 +76,14 @@ public class RelayManager : MonoBehaviour
         var utp = (UnityTransport)NetworkManager.Singleton.NetworkConfig.NetworkTransport;
         utp.OnTransportEvent -= HandleTransportEvent;
 
-        NetworkManager.Singleton.OnClientConnectedCallback -= null;
-        NetworkManager.Singleton.OnClientDisconnectCallback -= null;
-        NetworkManager.Singleton.OnServerStarted -= null;
+        NetworkManager.Singleton.OnClientConnectedCallback -= HandleClientConnected;
+        NetworkManager.Singleton.OnClientDisconnectCallback -= HandleClientDisconnected;
+        NetworkManager.Singleton.OnServerStarted -= HandleServerStarted;
     }
+
+    void HandleClientConnected(ulong id) => Debug.Log($"[Netcode] Client connected: {id}");
+    void HandleClientDisconnected(ulong id) => Debug.Log($"[Netcode] Client disconnected: {id}");
+    void HandleServerStarted() => Debug.Log("[Netcode] Server/Host started");
 
     void HandleTransportEvent(NetworkEvent evt, ulong _, System.ArraySegment<byte> __, float ___)
     {
@@ -99,7 +96,34 @@ public class RelayManager : MonoBehaviour
     }
 
 
-    public async Task<string> CreateRelayAndStartServerAsync(int maxConnections = 32)
+    static string GetConnectionType()
+    {
+        // WSS works in both the Editor and WebGL and avoids networks that block
+        // the UDP traffic used by DTLS. It also makes local testing match the web build.
+        return "wss";
+    }
+
+    UnityTransport ConfigureRelayTransport(Allocation allocation)
+    {
+        var utp = (UnityTransport)NetworkManager.Singleton.NetworkConfig.NetworkTransport;
+        string connectionType = GetConnectionType();
+        utp.UseWebSockets = connectionType == "wss";
+        utp.SetRelayServerData(allocation.ToRelayServerData(connectionType));
+        Debug.Log($"[Relay] Using {connectionType.ToUpperInvariant()}");
+        return utp;
+    }
+
+    UnityTransport ConfigureRelayTransport(JoinAllocation allocation)
+    {
+        var utp = (UnityTransport)NetworkManager.Singleton.NetworkConfig.NetworkTransport;
+        string connectionType = GetConnectionType();
+        utp.UseWebSockets = connectionType == "wss";
+        utp.SetRelayServerData(allocation.ToRelayServerData(connectionType));
+        Debug.Log($"[Relay] Using {connectionType.ToUpperInvariant()}");
+        return utp;
+    }
+
+    public async Task<string> CreateRelayAndStartHostAsync(int maxConnections = 32)
     {
         try
         {
@@ -110,30 +134,11 @@ public class RelayManager : MonoBehaviour
             var joinCode = await RelayService.Instance.GetJoinCodeAsync(alloc.AllocationId);
             Debug.Log($"[Relay] Join Code: {joinCode}");
 
-            var utp = (UnityTransport)NetworkManager.Singleton.NetworkConfig.NetworkTransport;
+            ConfigureRelayTransport(alloc);
 
-            var endpoint = PickEndpoint(alloc.ServerEndpoints, "dtls");
-            bool isSecure = endpoint != null && endpoint.ConnectionType == "dtls";
-            string host = endpoint != null ? endpoint.Host : alloc.RelayServer.IpV4;
-            ushort port = (ushort)(endpoint != null ? endpoint.Port : alloc.RelayServer.Port);
-
-            var relayData = new RelayServerData(
-                host: host,
-                port: port,
-                allocationId: alloc.AllocationIdBytes,
-                connectionData: alloc.ConnectionData,
-                hostConnectionData: alloc.ConnectionData,
-                key: alloc.Key,
-                isSecure: isSecure
-            );
-
-            utp.SetRelayServerData(relayData);
-
-            // IMPORTANT: prefer StartHost() (server + local client)
-            // 🚫 DO NOT StartHost() here — that creates a local client & player
-            if (!NetworkManager.Singleton.StartServer())
+            if (!NetworkManager.Singleton.StartHost())
             {
-                Debug.LogError("[Relay] StartServer() failed");
+                Debug.LogError("[Relay] StartHost() failed");
                 return "";
             }
 
@@ -146,38 +151,101 @@ public class RelayManager : MonoBehaviour
         }
     }
 
-    public async Task JoinRelayAndStartClientAsync(string joinCode)
+    // Dedicated/headless builds use a server with no local player.
+    public async Task<string> CreateRelayAndStartServerAsync(int maxConnections = 32)
     {
         try
         {
             ResetNetworking();
             await InitializeServicesAsync();
 
-            var joinAlloc = await RelayService.Instance.JoinAllocationAsync(joinCode);
-            var utp = (UnityTransport)NetworkManager.Singleton.NetworkConfig.NetworkTransport;
+            var alloc = await RelayService.Instance.CreateAllocationAsync(maxConnections);
+            var joinCode = await RelayService.Instance.GetJoinCodeAsync(alloc.AllocationId);
+            Debug.Log($"[Relay] Join Code: {joinCode}");
 
-            var endpoint = PickEndpoint(joinAlloc.ServerEndpoints, "dtls");
-            bool isSecure = endpoint != null && endpoint.ConnectionType == "dtls";
-            string host = endpoint != null ? endpoint.Host : joinAlloc.RelayServer.IpV4;
-            ushort port = (ushort)(endpoint != null ? endpoint.Port : joinAlloc.RelayServer.Port);
+            ConfigureRelayTransport(alloc);
 
-            var relayData = new RelayServerData(
-                host: host,
-                port: port,
-                allocationId: joinAlloc.AllocationIdBytes,
-                connectionData: joinAlloc.ConnectionData,
-                hostConnectionData: joinAlloc.HostConnectionData,
-                key: joinAlloc.Key,
-                isSecure: isSecure
-            );
+            if (!NetworkManager.Singleton.StartServer())
+            {
+                Debug.LogError("[Relay] StartServer() failed");
+                return "";
+            }
 
-            utp.SetRelayServerData(relayData);
-            NetworkManager.Singleton.StartClient();
+            return joinCode;
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[Relay][Server] {e}");
+            throw;
+        }
+    }
+
+    public async Task JoinRelayAndStartClientAsync(string joinCode)
+    {
+        TaskCompletionSource<bool> connectionResult = null;
+        Action<ulong> connectedHandler = null;
+        Action<ulong> disconnectedHandler = null;
+
+        try
+        {
+            ResetNetworking();
+            await InitializeServicesAsync();
+
+            var joinAlloc = await RelayService.Instance.JoinAllocationAsync(joinCode.Trim().ToUpperInvariant());
+            ConfigureRelayTransport(joinAlloc);
+
+            connectionResult = new TaskCompletionSource<bool>();
+            connectedHandler = id =>
+            {
+                if (id == NetworkManager.Singleton.LocalClientId)
+                {
+                    connectionResult.TrySetResult(true);
+                }
+            };
+            disconnectedHandler = id =>
+            {
+                if (!NetworkManager.Singleton.IsConnectedClient)
+                {
+                    connectionResult.TrySetResult(false);
+                }
+            };
+
+            NetworkManager.Singleton.OnClientConnectedCallback += connectedHandler;
+            NetworkManager.Singleton.OnClientDisconnectCallback += disconnectedHandler;
+
+            if (!NetworkManager.Singleton.StartClient())
+            {
+                throw new InvalidOperationException("StartClient() failed");
+            }
+
+            Task finishedTask = await Task.WhenAny(connectionResult.Task, Task.Delay(15000));
+            if (finishedTask != connectionResult.Task)
+            {
+                NetworkManager.Singleton.Shutdown();
+                throw new TimeoutException("The Relay connection timed out after 15 seconds.");
+            }
+
+            if (!await connectionResult.Task)
+            {
+                throw new InvalidOperationException("The Relay server disconnected before the client connected.");
+            }
+
+            Debug.Log("[Relay] Client connection confirmed");
         }
         catch (System.Exception e)
         {
             Debug.LogError($"[Relay][Client] {e}");
             throw;
+        }
+        finally
+        {
+            if (NetworkManager.Singleton != null)
+            {
+                if (connectedHandler != null)
+                    NetworkManager.Singleton.OnClientConnectedCallback -= connectedHandler;
+                if (disconnectedHandler != null)
+                    NetworkManager.Singleton.OnClientDisconnectCallback -= disconnectedHandler;
+            }
         }
     }
 }
